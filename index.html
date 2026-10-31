@@ -852,7 +852,7 @@
       <div class="mp-k mp-k-mode" style="margin-top:14px">模式</div>
       <div class="mp-modes" id="mpModes">
         <button class="mp-mode act" data-mode="coop">合作强袭<small>10 名敌兵 · 3 分钟清场 · 2-5 人</small></button>
-        <button class="mp-mode" data-mode="pvp">1v1 死斗<small>15 杀或 5 分钟 · 无补给</small></button>
+        <button class="mp-mode" data-mode="pvp">1v1 死斗<small>15 杀或 5 分钟 · 四枪全解锁 · 无限弹药</small></button>
         <button class="mp-mode" data-mode="survival">波次生存<small>无尽波次 · 最多 5 人协同防守</small></button>
       </div>
       <div class="mp-k" style="margin-top:16px">小队 <span id="mpCount">1/5</span></div>
@@ -5241,6 +5241,9 @@ function saveSet(){ try { localStorage.setItem(SET_STORE, JSON.stringify(SET)); 
 const WIDX = {};                                   // 武器 id → WEAPONS 下标
 WEAPONS.forEach((w,i)=>{ WIDX[w.id] = i; });
 const WSHORT = { rifle:'M4', shotgun:'KS-12', pistol:'P9', sniper:'SR-7' };
+/* 死斗的军械库顺序 = 数字键 1-4；四把枪开局即解锁 */
+const PVP_GUNS = ['rifle','shotgun','pistol','sniper'];
+const pvpInfAmmo = ()=> G.mode === 'pvp';
 const INV = { guns:['rifle','pistol'], nades:{ frag:2, flash:0 } };   // 拥有（不一定在槽位里）
 
 const NADES = {
@@ -5701,12 +5704,13 @@ function updateAmmoUI(){
   } else {
     const w = WEAPONS[player.weapon];
     UI.magNum.textContent = w.mag;
-    UI.resNum.textContent = '/ ' + w.res;
+    UI.resNum.textContent = '/ ' + (pvpInfAmmo() ? '∞' : w.res);
     UI.magNum.classList.toggle('empty', w.mag===0);
     UI.wname.textContent = w.name;
-    UI.wmode.textContent = w.id==='rifle' ? (w.semi?'半自动':'全自动')
+    UI.wmode.textContent = (w.id==='rifle' ? (w.semi?'半自动':'全自动')
                           : w.id==='shotgun' ? '泵动'
-                          : w.id==='sniper'  ? '栓动' : '半自动';
+                          : w.id==='sniper'  ? '栓动' : '半自动')
+                          + (pvpInfAmmo() ? ' · 无限弹药' : '');
     if (UI._icon !== player.weapon){ UI._icon = player.weapon; UI.wicon.innerHTML = WICONS[player.weapon]; }
     const need = w.mag===0 || (w.mag <= w.magSize*0.25 && w.res>0);
     UI.reloadHint.textContent = (w.mag===0 && w.res===0) ? '弹药耗尽'
@@ -6037,10 +6041,15 @@ addEventListener('keydown', e=>{
   if (['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV','Tab','ControlLeft'].includes(e.code)) e.preventDefault();
   if (!G.running) return;
   if (e.code==='KeyR') startReload();
-  if (e.code==='Digit1') switchWeaponSlot(0);
-  if (e.code==='Digit2') switchWeaponSlot(1);
-  if (e.code==='Digit3') switchWeaponSlot(2);
-  if (e.code==='Digit4') switchWeaponSlot(2);
+  const di = ['Digit1','Digit2','Digit3','Digit4'].indexOf(e.code);
+  if (di >= 0){
+    if (G.mode === 'pvp' && NET.pvp){
+      /* 死斗：四把枪开局全解锁，1-4 直接拿枪 */
+      equipGun(PVP_GUNS[di]);
+      updateAmmoUI(); refreshTouchUI();
+    } else if (di >= 2) switchWeaponSlot(2);
+    else switchWeaponSlot(di);
+  }
   if (e.code==='KeyV'){
     const w = WEAPONS[player.weapon];
     if (w.semiToggle){ w.semi=!w.semi; SFX.boltClick(); updateAmmoUI(); }
@@ -6051,7 +6060,9 @@ addEventListener('keydown', e=>{
 });
 addEventListener('keyup', e=>{ keys[e.code]=false; });
 addEventListener('mousemove', e=>{
-  if (document.pointerLockElement !== document.body) return;
+  const locked = document.pointerLockElement === document.body;
+  /* 没锁上但处于自由视角时也吃鼠标位移，否则预览窗口里根本转不了头 */
+  if (!locked && !(LOOK.free && G.running && !G.paused && !shopOpen && !bagOpen)) return;
   mouseDX += e.movementX || 0;
   mouseDY += e.movementY || 0;
 });
@@ -6121,21 +6132,41 @@ document.addEventListener('pointerlockchange', ()=>{
   } else if (shopOpen){
     /* 补给面板要光标：万一锁是面板打开之后才批下来的，立刻再交还一次 */
     document.exitPointerLock();
-  } else resumeGame();
+  } else { setFreeLook(false); resumeGame(); }
 });
+/* 指针锁定失败时的退路：预览 iframe、浏览器策略、Safari 都可能拒绝锁。
+   旧逻辑是"锁不上就停在暂停卡"，在世界另一端还有队友在打的时候等于断线。 */
+const LOOK = { free:false, fails:0 };
+function setFreeLook(on){
+  LOOK.free = !!on;
+  if (on) LOOK.fails = 2;
+  document.body.classList.toggle('nolock', !!on && !IS_TOUCH);
+  document.body.style.cursor = (on && !IS_TOUCH) ? 'none' : '';
+  const el = $('mpState');
+  if (on && el && (NET.guest || NET.host) && G.running) mpState('自由视角（点击画面可重试锁定）', true);
+}
+addEventListener('pointerlockerror', ()=>{ LOOK.fails = Math.max(LOOK.fails, 1); });
 function requestLock(){
   /* iOS has no pointer lock at all and Android's drops the address bar into
      fullscreen weirdness, so touch rounds simply run unlocked. */
   if (IS_TOUCH){ resumeGame(); return; }
-  const p = document.body.requestPointerLock();
-  if (p && p.catch) p.catch(()=>{});
+  try {
+    const p = document.body.requestPointerLock();
+    if (p && p.catch) p.catch(()=>{});
+  } catch(_){}
   /* a denied request fires no pointerlockchange, which would leave the round
-     live but with no mouse look. fall back to the pause overlay so a second
-     click can try again. */
+     live but with no mouse look. fall back to a free-look camera instead of a
+     dead pause card. */
   clearTimeout(requestLock._t);
   requestLock._t = setTimeout(()=>{
     if (document.pointerLockElement === document.body) return;
     if (shopOpen) return;                     // 面板开着时别因为没锁上而暂停世界
+    LOOK.fails++;
+    if (LOOK.fails >= 2 || NET.open){
+      setFreeLook(true);
+      if (G.started && !G.over) resumeGame();
+      return;
+    }
     pauseGame();
   }, 350);
 }
@@ -6341,6 +6372,18 @@ if (IS_TOUCH) (function setupTouch(){
     nade.addEventListener('lostpointercapture', nadeUp);
   }
 
+  /* 死斗：点弹药栏在四把枪之间轮换（触屏没有数字键） */
+  {
+    const am = $('ammo');
+    if (am) am.addEventListener('pointerdown', e=>{
+      if (!G.running || !(G.mode === 'pvp' && NET.pvp)) return;
+      e.preventDefault(); e.stopPropagation();
+      const cur = PVP_GUNS.indexOf(WEAPONS[player.weapon].id);
+      equipGun(PVP_GUNS[(cur + 1) % PVP_GUNS.length]);
+      SFX.equipClick(); updateAmmoUI(); refreshTouchUI();
+    });
+  }
+
   /* weapon strip: tapping the live slot toggles fire mode, the way V does */
   for (const s of UI.slots){
     s.style.pointerEvents = 'auto';
@@ -6476,7 +6519,8 @@ function switchWeapon(i){
 function startReload(){
   const w = WEAPONS[player.weapon];
   if (player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0) return;
-  if (w.mag>=w.magSize || w.res<=0) return;
+  if (w.mag>=w.magSize || (!pvpInfAmmo() && w.res<=0)) return;
+  if (pvpInfAmmo()) w.res = w.reserve;
   setADS(false);
   player.reloadT = w.reloadTime;
   player.reloadPhase = 0;
@@ -6484,9 +6528,11 @@ function startReload(){
 }
 function finishReload(){
   const w = WEAPONS[player.weapon];
+  if (pvpInfAmmo()) w.res = w.reserve;      // 死斗：备弹永远满，换弹只受弹匣限制
   const need = w.magSize - w.mag;
   const take = Math.min(need, w.res);
   w.mag += take; w.res -= take;
+  if (pvpInfAmmo()) w.res = w.reserve;
   w.spread = w.spreadBase;
   updateAmmoUI();
 }
@@ -6503,6 +6549,8 @@ function fireWeapon(){
     return true;
   }
   w.mag--;
+  /* 死斗：备弹无限，打完立刻回满，只需要换弹匣 */
+  if (pvpInfAmmo()) w.res = w.reserve;
   player.fireCooldown = 60/w.rpm;
   G.shots++;
   player.triggerReleased = false;
@@ -6558,7 +6606,12 @@ function fireWeapon(){
         const e = ud.enemy;
         const dist = h.distance;
         if (isGuest){
-          /* 等房主的命中回执，本地不算伤害 */
+          /* 伤害仍然等房主的回执，但落点的血雾必须本地出：
+             以前这里是一句空分支，客机打中敌人时屏幕上一点反馈都没有 */
+          const isHead = ud.part==='head';
+          anyHit = true;
+          if (isHead) headHit = true;
+          fxImpactFlesh(h.point, dir, dist, isHead);
         } else {
           let dmg = w.damage;
           const fo = clamp(1 - Math.max(0, dist-w.falloffStart)/w.falloffRange, w.falloffMin, 1);
@@ -6902,7 +6955,8 @@ function enemyShoot(e, atPoint){
 
   enemyMuzzleFlash(muzzle);
   const pan = clamp((e.obj.position.x-camera.position.x)/16,-1,1);
-  SFX.gunshot(rnd()<0.5?'rifle':'pistol', pan, dist);
+  const sndRifle = rnd()<0.5;
+  SFX.gunshot(sndRifle?'rifle':'pistol', pan, dist);
 
   /* trace against the world, then test the player capsule */
   losRay.set(muzzle, dir); losRay.far = 90;
@@ -6927,6 +6981,14 @@ function enemyShoot(e, atPoint){
   }
   const end = muzzle.clone().addScaledVector(dir, Math.min(wallDist, tHit===Infinity?90:tHit));
   spawnTracer(muzzle, end, 0xff9a5a, 1.25);
+  /* 联机：这一枪要出现在队友屏幕上（枪口焰 + 曳光 + 枪声），
+     否则队友看到的是一群不开枪的靶子。和快照同包发，10Hz 合并一次 */
+  if (NET.host && NET.open && NET.shots){
+    NET.shots.push([Math.round(muzzle.x*100)/100, Math.round(muzzle.y*100)/100, Math.round(muzzle.z*100)/100,
+                    Math.round(end.x*100)/100, Math.round(end.y*100)/100, Math.round(end.z*100)/100,
+                    sndRifle ? 1 : 0]);
+    if (NET.shots.length > 24) NET.shots.shift();
+  }
 
   /* Confirm the path from the player's end before it costs health — same
      back-face problem as hasLOS, and this is the one that actually hurts. */
@@ -8253,12 +8315,13 @@ function startGame(fromNet, mode){
        一旦切进全屏，整排按键就会跟着视口高度整体错位 */
     G.paused=false; UI.pause.classList.remove('on');
   } else if (fromNet){
-    /* 队友是被动开局的，没有用户手势就拿不到指针锁定：先给一张“点击进入”
-       的卡，那一下点击才让浏览器允许锁鼠标 */
-    G.running = false; G.paused = true; G.pausedAt = 0;
-    UI.pause.querySelector('.t').textContent = '准备进入';
-    UI.pause.querySelector('.s').textContent = '点击进入战场';
-    UI.pause.classList.add('on');
+    /* 队友是被动开局的：浏览器不会在非用户手势里批指针锁定，但绝不能因此
+       把世界停住。旧版会弹一张“准备进入”的卡，锁不到鼠标就永远停着 ——
+       客机于是只看到队友在动，敌人和地图全冻住，体感就是“一进游戏就断连”。
+       现在直接开跑，同时试一次锁定；锁不上就退化成自由视角。 */
+    G.paused = false; G.running = true;
+    UI.pause.classList.remove('on');
+    requestLock();
   } else requestLock();
 }
 function restart(){
@@ -8372,6 +8435,8 @@ const NET = {
   set avatar(v){ this.avatars[0] = v; },
   code:'', open:false, connecting:false, full:false, fullPvp:false,
   lastSend:0, lastSnap:0, lastBeat:0, spectate:false, ended:false,
+  shots:[],                        // 房主：本帧要随快照广播的敌兵枪声
+  reconnecting:false,              // 客机：正在自动重连
   mode:'coop', pvp:false, pvpKills:0, remoteKills:0, respawnT:0
 };
 function mkRemote(){
@@ -8418,14 +8483,26 @@ function playerCentroid(){
 }
 
 function peerIdFor(code){ return 'ironhold-v1-' + String(code).toLowerCase(); }
+/* 发送前先看一眼 SCTP 的积压：手机的 DataChannel 只有几百 KB 缓冲，
+   客机稍微卡一下（渲染掉帧、切后台）就把它灌满，Chromium 会直接把通道
+   掐掉 —— 表现出来就是“一进游戏就断连”。宁可丢掉这一帧快照，也不能
+   让整条连接报废：下一帧 100ms 后就是新的完整世界。 */
+function netCanSend(c){
+  if (!c || !c.open) return false;
+  try {
+    const dc = c.dataChannel || c._dc;
+    if (dc && dc.bufferedAmount > 262144) return false;
+  } catch(_){}
+  return true;
+}
 /* 上行（客机→房主）或广播（房主→所有客机） */
 function netSend(msg){
   if (NET.host){
     for (const k in NET.conns){
       const c = NET.conns[k];
-      if (c && c.conn && c.conn.open){ try { c.conn.send(msg); } catch(_){} }
+      if (c && c.conn && netCanSend(c.conn)){ try { c.conn.send(msg); } catch(_){} }
     }
-  } else if (NET.conn && NET.conn.open){
+  } else if (NET.conn && netCanSend(NET.conn)){
     try { NET.conn.send(msg); } catch(_){}
   }
 }
@@ -8434,7 +8511,7 @@ function netSendTo(seat, msg){
   if (!NET.host) return;
   for (const k in NET.conns){
     const c = NET.conns[k];
-    if (c && c.seat === seat && c.conn && c.conn.open){ try { c.conn.send(msg); } catch(_){} return; }
+    if (c && c.seat === seat && c.conn && netCanSend(c.conn)){ try { c.conn.send(msg); } catch(_){} return; }
   }
 }
 function mpState(text, on){
@@ -8674,7 +8751,8 @@ function mpBindConn(conn, asHost){
   } else {
     NET.conn = conn;
     conn.on('open', ()=>{
-      if (NET.open) return;
+      /* 重连成功后把计数清零，下次掉线还能再救一次 */
+      mpReconnectCancel();
       NET.open = true;
       mpState('已连接', true);
       $('mpJoinNote').textContent = '已连接房主，等待房主开始任务…';
@@ -8730,6 +8808,44 @@ function mpOnDrop(){
     $('mpJoinNote').textContent = '与房主的连接已断开';
   }
   if (G.running && !NET.host) NET.spectate = true;
+  /* 客机掉线：自动重连。以前这里只把状态改成“连接已断开”，队友必须自己
+     刷新页面才能回来 —— 体感就是“进去之后全程断连，只能看队友动”。 */
+  if (!NET.host && NET.guest && NET.code && !NET.reconnecting){
+    clearTimeout(_reconTimer);
+    _reconTimer = setTimeout(()=>{ if (!NET.open) mpReconnect(); }, 1500);
+  }
+}
+
+/* ---------------- 客机自动重连 ---------------- */
+let _reconTimer = 0, _reconTries = 0;
+function mpReconnectCancel(){
+  clearTimeout(_reconTimer); _reconTimer = 0; _reconTries = 0; NET.reconnecting = false;
+}
+function mpReconnect(){
+  if (NET.host || !NET.code || NET.reconnecting) return;
+  if (_reconTries >= 4){ mpState('连接已断开'); $('mpJoinNote').textContent = '重连失败，请刷新页面重新加入'; return; }
+  if (typeof Peer === 'undefined') return;
+  _reconTries++;
+  NET.reconnecting = true;
+  mpState('重连中…（' + _reconTries + '/4）');
+  try { if (NET.peer) NET.peer.destroy(); } catch(_){}
+  NET.peer = null;
+  const peer = new Peer({ debug:0, config:ICE });
+  NET.peer = peer;
+  peer.on('open', ()=>{
+    NET.reconnecting = false;
+    let c = null;
+    try { c = peer.connect(peerIdFor(NET.code), { reliable:true }); } catch(_){}
+    if (c) mpBindConn(c, false);
+    clearTimeout(_reconTimer);
+    _reconTimer = setTimeout(()=>{ if (!NET.open) mpReconnect(); }, 4500);
+  });
+  peer.on('error', ()=>{
+    NET.reconnecting = false;
+    clearTimeout(_reconTimer);
+    _reconTimer = setTimeout(mpReconnect, 2200);
+  });
+  peer.on('disconnected', ()=>{ try { peer.reconnect(); } catch(_){} });
 }
 
 /* ---------------- 退出房间 ---------------- */
@@ -8748,6 +8864,7 @@ function mpResetUI(){
 
 /* notify=true 表示是自己点的退出：先给对方发一句 bye，再拆连接 */
 function mpLeave(notify){
+  mpReconnectCancel();                       // 主动退房就别再自动连回去了
   if (notify) netSend({ t:'bye' });
   if (NET.host){
     for (const k in NET.conns){ try { if (NET.conns[k]) NET.conns[k].conn.close(); } catch(_){} }
@@ -8759,6 +8876,7 @@ function mpLeave(notify){
   try { if (NET.peer) NET.peer.destroy(); } catch(_){}
   NET.peer = null;
   NET.open = false; NET.host = false; NET.guest = false; NET.seat = 0; NET.full = false; NET.fullPvp = false;
+  NET.code = '';
   for (let i=0;i<4;i++){
     const r = NET.remotes[i];
     r.on = false; r.dead = false; r.down = 0; r.downT = 0;
@@ -8842,6 +8960,13 @@ function onNetData(m, seat){
         netSend({ t:'pdown', i:seat });
         pushComms('指挥', '支援兵倒下了，靠近按住 E 救援');
       }
+    } else if (m.t === 'score'){
+      /* 客机在 1v1 里打死了房主，或自己算的比分：房主以前根本不接这条，
+         结果客机那边先到 15 杀、房主这边还停在 0，两边结算完全对不上 */
+      G.pvpKills = Math.max(G.pvpKills | 0, m.b | 0);
+      NET.remoteKills = Math.max(NET.remoteKills | 0, m.a | 0);
+      updatePvpScore();
+      pvpCheckEnd();
     } else if (m.t === 'bye'){
       const e = connOfSeat(seat);
       if (e) mpOnConnClose(Object.keys(NET.conns).find(k=>NET.conns[k]===e));
@@ -8935,10 +9060,11 @@ function onNetData(m, seat){
           SFX.muffle(true); SFX.ringing();
           player.shake = Math.min(1.5, player.shake + 0.5);
         } else {
-          damagePlayer(NADES.frag.dmg * k * 0.62, p);
+          /* 手雷的自伤只认房主的判定（damageTarget → 'hp'）。
+             以前这里本地再扣一遍、还把结果报回房主，等于双方各扣一次，
+             一颗雷能炸掉两倍血 */
           player.shake = Math.min(1.6, player.shake + 0.8*k);
         }
-        netSend({ t:'stat', hp:Math.round(player.hp), a:Math.round(player.armor), lv:player.armorLv|0 });
       }
     } else if (m.t === 'kf'){
       killFeed(m.v, !!m.hd, m.g ? '你' : '队友');
@@ -9009,11 +9135,22 @@ function applyGuestState(m, seat){
 }
 
 /* 队友：房主下发的世界快照 */
+const _snapA = new THREE.Vector3(), _snapB = new THREE.Vector3();
 function applySnapshot(m){
   G.time = m.tm;
   G.kills = m.k;
   G.headshots = m.hs;
   UI.killCount.textContent = G.kills;
+
+  /* 死斗比分镜像：房主看到的 pk/rk = 房主击杀 / 客机击杀，
+     客机这边要反过来读，否则自己的击杀会显示在队友那一栏。
+     取 max 是为了不让"本地刚结算、房主回执还没到"的那一下数字回退。 */
+  if (NET.pvp && m.pk !== undefined){
+    const before = G.pvpKills + ':' + NET.remoteKills;
+    G.pvpKills      = Math.max(G.pvpKills | 0, m.rk | 0);   // 我的击杀（房主视角的"队友击杀"）
+    NET.remoteKills = Math.max(NET.remoteKills | 0, m.pk | 0); // 房主的击杀
+    if ((G.pvpKills + ':' + NET.remoteKills) !== before){ updatePvpScore(); pvpCheckEnd(); }
+  }
 
   /* 波次：客机不判定，只跟着房主的波数和人数把模型补齐 */
   if (G.mode === 'survival'){
@@ -9073,21 +9210,41 @@ function applySnapshot(m){
     }
   }
 
-  for (let i = 0; i < enemies.length; i++){
-    const e = enemies[i], s = m.en && m.en[i];
-    if (!s) continue;
-    /* 心跳包的占位项只有生死和血量，不能拿它去刷位姿 */
-    const hasPos = !(s[0] === 0 && s[1] === 0 && s[2] === 0 && s[4] !== ST.PATROL);
-    if (!hasPos){
-      if (s[5] && !e.dead) guestKillEnemy(e);
-      continue;
+  /* 敌兵：en[i] 与 enemies[i] 严格同下标（房主端会为尸体保留 null 占位） */
+  if (Array.isArray(m.en)){
+    for (let i = 0; i < enemies.length; i++){
+      const e = enemies[i], s = m.en[i];
+      if (!s) continue;
+      if (m.hb){
+        /* 心跳包只带生死和血量，绝不能用它摆位 */
+        if (s[5] && !e.dead) guestKillEnemy(e);
+        if (!e.dead && s[7] !== undefined && s[7] !== e._netHp){
+          e._netHp = s[7]; e.hp = s[7];
+          if (e.tag) e.tag.draw(e.hp, false, e.hpMax);
+        }
+        continue;
+      }
+      e.net = { x:s[0], y:s[1], z:s[2], yaw:s[3], st:s[4], dead:!!s[5], spd:s[6], hp:s[7] };
+      if (e.net.dead && !e.dead) guestKillEnemy(e);
+      if (!e.dead && e.net.hp !== e._netHp){
+        e._netHp = e.net.hp;
+        e.hp = e.net.hp;
+        if (e.tag) e.tag.draw(e.hp, e.net.st === ST.COMBAT || e.net.st === ST.ALERT, e.hpMax);
+      }
     }
-    e.net = { x:s[0], y:s[1], z:s[2], yaw:s[3], st:s[4], dead:!!s[5], spd:s[6], hp:s[7] };
-    if (e.net.dead && !e.dead) guestKillEnemy(e);
-    if (!e.dead && e.net.hp !== e._netHp){
-      e._netHp = e.net.hp;
-      e.hp = e.net.hp;
-      if (e.tag) e.tag.draw(e.hp, e.net.st === ST.COMBAT || e.net.st === ST.ALERT, e.hpMax);
+  }
+
+  /* 敌兵开火：房主把这一帧的枪声打包发过来，客机放枪口焰 + 曳光 + 声音。
+     以前这条完全没有，客机眼里的敌人是“站着不动也不开枪”的木桩 */
+  if (Array.isArray(m.fs)){
+    for (const f of m.fs){
+      if (!f || f.length < 6) continue;
+      const from = _snapA.set(f[0], f[1], f[2]);
+      const to = _snapB.set(f[3], f[4], f[5]);
+      enemyMuzzleFlash(from);
+      spawnTracer(from, to, 0xff9a5a, 1.25);
+      const d = from.distanceTo(camera.position);
+      SFX.gunshot((f[6]|0) ? 'rifle' : 'pistol', clamp((from.x-camera.position.x)/16,-1,1), d);
     }
   }
 }
@@ -9129,7 +9286,11 @@ function hideNetBanner(){
 
 /* ---------------- 队友开火 -> 房主判定 ---------------- */
 const _shotO = new THREE.Vector3(), _shotD = new THREE.Vector3();
-function hostApplyShot(m){
+function hostApplyShot(m, seat){
+  /* seat 是这条连接对应的座位：命中回执 / 枪声惊动都要用到。
+     旧签名漏了这个参数，函数体里的 seat 直接抛 ReferenceError，
+     被 conn.on('data') 的 try/catch 吞掉 —— 客机因此永远收不到命中反馈 */
+  if (!m || !Array.isArray(m.r)) return;
   const w = WEAPONS[m.w];
   if (!w || !Array.isArray(m.r)) return;
   let any = false, head = false, kill = false;
@@ -9182,14 +9343,21 @@ function netTick(dt, now){
     const snap = G.running && !G.over && now - NET.lastSnap > 100;
     if (snap) NET.lastSnap = now;
     if (beat || snap){
+      /* 只有「这一包带坐标」才允许客机摆位。
+         以前心跳包用 [0,0,0,...] 占位，靠 state !== PATROL 去猜是不是占位 ——
+         而 ST.PATROL 正好是 0，于是每次心跳（每 2 秒）巡逻中的敌兵都会被
+         客机搬到世界原点，再被下一帧快照拽回来，看起来就是“敌人原地乱闪 /
+         根本不同步”。现在用 hb 明确标记，客机不再猜。 */
+      const full = snap;
+      /* en 必须与 enemies 下标严格一一对应：客机靠 i 取 en[i]。
+         尸体在快照里用 null 占位（以前直接 continue，导致第一具尸体之后
+         所有敌人的数据整体前移，客机的第 i 个敌人拿到第 i+1 个的数据） */
       const en = [];
-      /* 尸体停止位移后不再进快照：活人全死后尸体还能活 7 秒，
-         那一串静态数组是整条连接上最没必要的大包 */
       for (const e of enemies){
-        if (!beat && e.dead && e.deathT >= 1) continue;
-        if (beat){
-          /* 心跳只带「谁死谁活」，客机照样靠下标对齐，但不用吃完整坐标 */
+        if (!full){
           en.push([0, 0, 0, 0, e.state, e.dead?1:0, 0, Math.round(e.hp)]);
+        } else if (e.dead && e.deathT >= 1){
+          en.push(null);            // 尸体不再传坐标，但位置要占住
         } else {
           const p = e.obj.position;
           en.push([Math.round(p.x*100)/100, Math.round(p.y*100)/100, Math.round(p.z*100)/100,
@@ -9197,6 +9365,11 @@ function netTick(dt, now){
                    Math.round(e.speed*10)/10, Math.round(e.hp)]);
         }
       }
+      /* 本帧的枪声事件（敌兵开火），和快照同包发走，客机才能看见/听见还击。
+         注意必须 slice 出一份新的：PeerJS 会把消息排进发送队列，等真正序列化
+         时这里已经把原数组清空了 */
+      const fs = NET.shots && NET.shots.length ? NET.shots.slice() : null;
+      if (NET.shots) NET.shots.length = 0;
       /* 其余客机的位姿/血量/倒地状态，null = 空座位 */
       const pl = [];
       for (let s=1; s<=4; s++){
@@ -9211,9 +9384,13 @@ function netTick(dt, now){
                 px:Math.round(player.pos.x*100)/100, py:Math.round(player.pos.y*100)/100,
                 pz:Math.round(player.pos.z*100)/100,
                 ya:Math.round(player.yaw*100)/100, pi:Math.round(player.pitch*100)/100,
-                hd:Math.round(player.hp), en, pl,
+                hd:Math.round(player.hp), en, pl, hb: full?0:1, fs,
                 wv:G.wave, ws:G.waveState, wt:Math.round(G.waveTimer*10)/10, wq:enemies.length,
-                wk:G.waveCleared });
+                wk:G.waveCleared,
+                /* 死斗比分：以前只在大厅广播一次模式，进游戏后比分两端各算各的，
+                   客机永远看不到房主的击杀数。这里每帧带上，客机按镜像关系接收。 */
+                pk:NET.pvp ? (G.pvpKills|0) : 0,
+                rk:NET.pvp ? (NET.remoteKills|0) : 0 });
     }
   } else if (G.running && !NET.spectate && !player.dead && now - NET.lastSend > 66){
     NET.lastSend = now;
@@ -9230,7 +9407,10 @@ function netTick(dt, now){
 function updatePvpScore(){
   const o = $('objective');
   if (!o) return;
-  if (NET.pvp) o.innerHTML = '你 <b>' + G.pvpKills + '</b> : ' + NET.remoteKills + ' 队友';
+  /* 两端视角统一：左边永远是"你"，右边永远是对手，避免客机看到的方向反过来 */
+  if (NET.pvp) o.innerHTML = '你 <b>' + (G.pvpKills|0) + '</b> : ' + (NET.remoteKills|0)
+                           + (NET.guest ? ' 房主' : ' 对手')
+                           + (IS_TOUCH ? ' · 点弹药栏换枪' : ' · 1-4 换枪');
   else if (G.mode === 'survival') updateSurvivalHUD();
   else {
     /* 生存模式会把 objective 整段换掉，回到任务模式时必须重新建出 #killCount，
@@ -9524,6 +9704,13 @@ function updateRemoteEnemies(dt){
     if (e.dead){ enemyDeathStep(e, dt); continue; }
     if (!n) continue;
     const obj = e.obj;
+    /* 第一次拿到网络位姿（刚刷出来的敌兵 / 刚进战场）直接落位，
+       别从本地随便生成的位置一路滑过去 */
+    if (!e._netInit){
+      e._netInit = true;
+      obj.position.set(n.x, n.y, n.z);
+      e.yaw = n.yaw;
+    }
     const k = 1 - Math.exp(-16*dt);
     const dx = n.x - obj.position.x, dz = n.z - obj.position.z;
     e.speed = damp(e.speed, clamp(Math.hypot(dx,dz)/Math.max(dt,0.0001), 0, 8), 14, dt);
@@ -10371,7 +10558,9 @@ function frame(now){
     if (!NET.guest && G.mode !== 'survival') G.time -= dt;   // 客机的时间完全由房主下发
     if (G.grace > 0) G.grace -= dt;
     updatePlayer(dt);
-    if (NET.guest && NET.open){
+    if (NET.guest){
+      /* 客机永不跑本地 AI：断线时宁可画面定格，也不要在客户机上凭空演一套
+         和房主不同的战况（上一版断线后会退回本地 AI，看着就是两个世界） */
       updateRemoteEnemies(dt);             // 队友端不跑 AI，只跟随快照
     } else {
       updateCombatDirector();
